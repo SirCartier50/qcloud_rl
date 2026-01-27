@@ -36,5 +36,12 @@ python install.py
   Most of the other files are source code from the qcloud simulator repo that I've altered a bit. These are neccesary for the main code since it pulls several functions from it.
 
 ## current issues
-  * When having more than one selected qpu, the job gets partitioned but the issue arises due to one of the functions that is called to do the paritioning. Before partitioning, a weighted graph (wig) representation of the job is generated to then be partitioned n amount of times (n being the number of selected qpus) but would sometimes provide a warning in which it can't partition a wig of 0 vertices. I've also noticed that sometimes the number of nodes in the wig is way less than the amount of selected qpus.
+  * When having more than one selected qpu, the job gets partitioned but the issue arises due to one of the functions that is called to do the paritioning. Before partitioning, a weighted graph (wig) representation of the job is generated to then be partitioned n amount of times (n being the number of selected qpus) but would sometimes provide a warning in which it can't partition a wig of 0 vertices.
+    Example output:
+    ```
+    [DEBUG] Weighted graph nodes: 0
+    [DEBUG] Selected QPUs: [0, 1, 5, 7] (count = 4)
+    ***Cannot bisect a graph with 0 vertices!
+    ***You are trying to partition a graph into too many parts!
+    ```
   
