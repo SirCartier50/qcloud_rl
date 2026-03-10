@@ -1,68 +1,95 @@
-# qcloud_env.py
+# qcloudenv.py
 
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import networkx as nx
 from des import DES, generatingJob
-from flowScheduler import  flow_scheduler_1
+from flowScheduler import flow_scheduler_1
 from jobScheduler import job_scheduler
 from cluster import qCloud, create_random_topology
 import random
 import time
 from jobScheduler import placement
 import math
+from collections import Counter
+
 
 
 class QCloudBatchEnv(gym.Env):
     """
     Batch RL environment for QPU selection (multi-binary actions).
 
-    - Each episode: a batch of jobs.
-    - Each step: pick a subset of QPUs (multi-binary vector) to run the current job.
-    - Reward:
-        - Negative communication cost for the current job.
-        - Penalty for invalid actions / unscheduled jobs.
-        - Final penalty for total unscheduled jobs at end of episode.
+    Key fixes added:
+      - Episode-wise permutation of QPU indices (prevents memorizing "always pick index 5")
+      - Better randomized + varied job batch generation
+      - Always reset qpu availability state each episode (simple + execution)
+      - Only decrement availability on the effective used QPUs
     """
 
     metadata = {"render_modes": []}
 
     def __init__(
         self,
-        qcloud,
+        qcloud_creator,
         job_generator,
         jobs_per_episode=8,
         reward_mode="simple",
-        invalid_penalty=-5.0,
-        unscheduled_penalty=-2.0,
+        invalid_penalty=-50.0,      # CHANGED default: make invalid clearly worse than typical valid costs
+        unscheduled_penalty=-20.0,  # CHANGED default
         comm_cost_scale=1.0,
+        unused_qpu_penalty=0.1,
+        use_makespan_reward=True,
+        # NEW knobs
+        permute_qpus_each_episode=True,
+        enforce_job_variety=True,
+        max_job_sampling_tries=250,
+        max_num_qpus=None,
     ):
         super().__init__()
-        assert reward_mode in ["simple", "wig", "execution"]
+        assert reward_mode in ["simple", "execution"]
 
-        self.qcloud = qcloud
+        self.qcloud_creator = qcloud_creator
+        self.qcloud = self.qcloud_creator()
         self.job_generator = job_generator
         self.jobs_per_episode = jobs_per_episode
         self.reward_mode = reward_mode
         self.invalid_penalty = float(invalid_penalty)
         self.unscheduled_penalty = float(unscheduled_penalty)
-        self.scheduler = job_scheduler(None, None, self.qcloud, scheduler_type='default')
-        self.des = None
-        self.flow_scheduler = None
-        if self.reward_mode == "execution":
-          #create a new logger so i can grab execution times
-          self.des = DES(self.qcloud, self.scheduler, None)
-          self.flow_scheduler = flow_scheduler_1(self.des, self.qcloud, epr_p=0.3, name="BFS")
+        self.comm_cost_scale = float(comm_cost_scale)
+        self.unused_qpu_penalty = float(unused_qpu_penalty)
+        self.use_makespan_reward = bool(use_makespan_reward)
+
+        self.permute_qpus_each_episode = bool(permute_qpus_each_episode)
+        self.enforce_job_variety = bool(enforce_job_variety)
+        self.max_job_sampling_tries = int(max_job_sampling_tries)
+
+        self.current_num_qpus = len(self.qcloud.qpus)
+        if max_num_qpus is None:
+            self.max_num_qpus = self.current_num_qpus
+        else:
+            self.max_num_qpus = int(max_num_qpus)
+            if self.current_num_qpus > self.max_num_qpus:
+                raise ValueError(f"Initial cloud size {self.current_num_qpus} > max_num_qpus {self.max_num_qpus}")
+
+        self.scheduler = job_scheduler(None, None, self.qcloud, scheduler_type="default")
 
         self.num_qpus = len(self.qcloud.qpus)
-        self.total_qubits = np.array(
-            [q.ncp_qubits for q in self.qcloud.qpus],
-            dtype=np.float32,
-        )
+        # Maps observation space index to real QPU index. -1 means padded/empty.
+        self.obs_to_real_map = np.full(self.max_num_qpus, -1, dtype=np.int32)
+
+        # permutation maps (obs/action index -> real qpu index)
+        self.perm = np.arange(self.num_qpus, dtype=np.int32)
+        self.inv_perm = np.arange(self.num_qpus, dtype=np.int32)
+
+        # capacities (recomputed on reset in case you later make heterogeneous clouds)
+        self.total_qubits = np.array([q.ncp_qubits for q in self.qcloud.qpus], dtype=np.float32)
 
         # features
-        self.node_feature_dim = 3
+        if self.reward_mode == "execution":
+            self.node_feature_dim = 5
+        else:
+            self.node_feature_dim = 3
         self.job_feature_dim = 3
 
         self.observation_space = spaces.Dict(
@@ -71,6 +98,7 @@ class QCloudBatchEnv(gym.Env):
                     low=0.0,
                     high=1.0,
                     shape=(self.num_qpus, self.node_feature_dim),
+                    shape=(self.max_num_qpus, self.node_feature_dim),
                     dtype=np.float32,
                 ),
                 "job_features": spaces.Box(
@@ -83,12 +111,14 @@ class QCloudBatchEnv(gym.Env):
                     low=0.0,
                     high=1.0,
                     shape=(self.num_qpus,),
+                    shape=(self.max_num_qpus,),
                     dtype=np.float32,
                 ),
             }
         )
 
         self.action_space = spaces.MultiBinary(self.num_qpus)
+        self.action_space = spaces.MultiBinary(self.max_num_qpus)
 
         # episode state
         self.jobs = None
@@ -98,24 +128,111 @@ class QCloudBatchEnv(gym.Env):
         self.unscheduled_jobs = None
         self.step_count = None
 
-        self.degrees = np.array(
-            [self.qcloud.network.degree(i) for i in range(self.num_qpus)],
-            dtype=np.float32,
-        )
+        self.degrees = np.array([self.qcloud.network.degree(i) for i in range(self.num_qpus)], dtype=np.float32)
+        self.degrees = np.array([self.qcloud.network.degree(i) for i in range(self.current_num_qpus)], dtype=np.float32)
         self.max_degree = max(1.0, float(self.degrees.max()))
+
+    def _refresh_capacity_state(self):
+        """
+        Reset per-episode availability state (numpy only).
+        We DO NOT need to mutate real QPU objects for simple reward,
+        but we do want consistent feasibility/masks across the episode.
+        """
+        # refresh capacities (in case cloud becomes heterogeneous later)
+        self.total_qubits = np.array([q.ncp_qubits for q in self.qcloud.qpus], dtype=np.float32)
+        self.qpu_available = self.total_qubits.copy().astype(np.float32)
+
+    def _sample_varied_jobs(self, seed=None):
+        """
+        Force a mixture of job sizes relative to max single-QPU capacity.
+        Helps the agent learn both "single QPU" and "must partition" cases.
+        """
+        # baseline capacity for categorization
+        cap = int(max(self.total_qubits.max(), 1.0))
+
+        def job_nq(job):
+            c = job.circuit
+            return int(getattr(c, "n_qubits", 0) or c.n_qubits)
+
+        jobs = []
+        tries = 0
+
+        # target mix (rough)
+        # - some <= cap (fits one QPU)
+        # - many between (cap, 3*cap] (needs 2-3 QPUs)
+        # - avoid > 3*cap (often impossible and teaches "be invalid")
+        while len(jobs) < self.jobs_per_episode and tries < self.max_job_sampling_tries:
+            tries += 1
+            j = self.job_generator.generate_random_job(num_jobs=1)[0]
+            nq = job_nq(j)
+
+            if nq <= cap:
+                accept = (random.random() < 0.35)
+            elif nq <= 2 * cap:
+                accept = (random.random() < 0.55)
+            elif nq <= 3 * cap:
+                accept = (random.random() < 0.85)
+            else:
+                accept = False
+
+            if accept:
+                jobs.append(j)
+
+        if len(jobs) < self.jobs_per_episode:
+            # fallback: just generate a full batch
+            jobs = self.job_generator.generate_random_job(num_jobs=self.jobs_per_episode)
+
+        random.shuffle(jobs)
+        return jobs
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        #change this also try for random job creation
-        self.jobs = self.job_generator.generate_job(self.jobs_per_episode, time_frame=10, step=1, probability=[0.2, 0.3, 0.5])
+
+        # make randomness actually change across episodes (also fixes same-job repeats)
+        if seed is not None:
+            np.random.seed(seed)
+            random.seed(seed)
+        
+        self.qcloud = self.qcloud_creator()
+        if len(self.qcloud.qpus) != self.num_qpus:
+            raise ValueError(f"qcloud_creator returned {len(self.qcloud.qpus)} QPUs, expected {self.num_qpus}")
+        self.current_num_qpus = len(self.qcloud.qpus)
+        if self.current_num_qpus > self.max_num_qpus:
+            raise ValueError(f"qcloud_creator returned {self.current_num_qpus} QPUs, but max is {self.max_num_qpus}")
+
+        self.degrees = np.array([self.qcloud.network.degree(i) for i in range(self.num_qpus)], dtype=np.float32)
+        self.degrees = np.array([self.qcloud.network.degree(i) for i in range(self.current_num_qpus)], dtype=np.float32)
+        self.max_degree = max(1.0, float(self.degrees.max()))
+
+        if self.scheduler:
+            self.scheduler.qcloud = self.qcloud
+        
+        # refresh availability & capacities every episode (simple + execution)
+        self._refresh_capacity_state()
+
+        # permute QPU indices each episode to prevent index memorization
+        # SCATTER STRATEGY: map real QPUs to random slots in the observation space
+        self.obs_to_real_map.fill(-1)
+        if self.permute_qpus_each_episode:
+            self.perm = np.random.permutation(self.num_qpus).astype(np.int32)
+            self.inv_perm = np.empty_like(self.perm)
+            self.inv_perm[self.perm] = np.arange(self.num_qpus, dtype=np.int32)
+            active_slots = np.random.choice(self.max_num_qpus, self.current_num_qpus, replace=False)
+        else:
+            self.perm = np.arange(self.num_qpus, dtype=np.int32)
+            self.inv_perm = np.arange(self.num_qpus, dtype=np.int32)
+            active_slots = np.arange(self.current_num_qpus)
+        self.obs_to_real_map[active_slots] = np.arange(self.current_num_qpus)
+
+        # jobs: random + varied distribution (optional but recommended)
+        if self.enforce_job_variety:
+            self.jobs = self._sample_varied_jobs(seed=seed)
+        else:
+            self.jobs = self.job_generator.generate_random_job(num_jobs=self.jobs_per_episode)
+            random.shuffle(self.jobs)
+
         self.current_job_idx = 0
         self.current_job = self.jobs[0]
-
-        self.qpu_available = np.array(
-            [q.available_qubits for q in self.qcloud.qpus],
-            dtype=np.float32,
-        )
-
         self.unscheduled_jobs = 0
         self.step_count = 0
 
@@ -125,8 +242,20 @@ class QCloudBatchEnv(gym.Env):
 
     def step(self, action):
         self.step_count += 1
+
         action = np.array(action, dtype=np.int32)
-        selected_qpus = np.where(action == 1)[0].tolist()
+
+        # action is in OBS index space; map to REAL qpu indices
+        selected_obs_idx = np.where(action == 1)[0].astype(np.int32)
+        selected_qpus = self.perm[selected_obs_idx].tolist()
+        selected_obs_indices = np.where(action == 1)[0]
+
+        # Map selected observation indices to real QPU indices, filtering out padded ones
+        selected_qpus = []
+        for obs_idx in selected_obs_indices:
+            real_idx = self.obs_to_real_map[obs_idx]
+            if real_idx != -1:
+                selected_qpus.append(real_idx)
 
         done = False
         truncated = False
@@ -140,52 +269,167 @@ class QCloudBatchEnv(gym.Env):
         # validate action
         if len(selected_qpus) == 0:
             invalid = True
-
-        total_sel_qubits = (
-            float(self.qpu_available[selected_qpus].sum())
-            if not invalid
-            else 0.0
-        )
-        if not invalid and total_sel_qubits < job_nq:
-            invalid = True
+        else:
+            total_sel_qubits = float(self.qpu_available[selected_qpus].sum())
+            if total_sel_qubits < job_nq:
+                invalid = True
 
         if invalid:
             reward += self.invalid_penalty
             self.unscheduled_jobs += 1
         else:
-            remaining = job_nq
+            remaining = float(job_nq)
             q_sorted = sorted(
                 selected_qpus,
-                key=lambda idx: self.qpu_available[idx],
+                key=lambda idx: float(self.qpu_available[idx]),
                 reverse=True,
             )
-            for qi in q_sorted:
-                if remaining <= 0:
-                    break
-                can_take = min(remaining, self.qpu_available[qi])
-                self.qpu_available[qi] -= can_take
-                remaining -= can_take
 
-            if remaining > 0:
+            # shrink selection to only the QPUs actually needed to meet demand
+            used_qpus = []
+            cap_sum = 0.0
+            for qi in q_sorted:
+                if cap_sum >= remaining:
+                    break
+                avail = float(self.qpu_available[qi])
+                if avail > 0:
+                    used_qpus.append(qi)
+                    cap_sum += avail
+
+            if cap_sum < remaining or len(used_qpus) == 0:
                 reward += self.invalid_penalty
                 self.unscheduled_jobs += 1
             else:
-              circuit = job.circuit
-              wig = self.scheduler.convert_to_weighted_graph(circuit)
-              if len(selected_qpus) == 1:
-                place = placement(job, 1, [self.qcloud.qpus[i] for i in selected_qpus], wig)
-              else:
-                place = placement(job, self.scheduler.partition_circuit(len(selected_qpus),wig), [self.qcloud.qpus[i] for i in selected_qpus], wig)
+                # discourage selecting extra unused qpus
+                extra = max(0, len(selected_qpus) - len(used_qpus))
+                reward -= self.unused_qpu_penalty * float(extra)
 
-              if self.reward_mode == "simple":
-                comm_cost = place.get_communication_cost()
-                reward -= comm_cost
-              else:
-                #add job to queue for flow scheduler
-                place.start_time = self.des.current_time
-                self.scheduler._schedule_new(place, job, "BFS")
-                self.scheduler.scheduled_job.append(job)
+                # decrement only the QPUs we actually use
+                remaining = float(job_nq)
+                for qi in used_qpus:
+                    if remaining <= 0:
+                        break
+                    can_take = min(remaining, float(self.qpu_available[qi]))
+                    self.qpu_available[qi] -= can_take
+                    remaining -= can_take
 
+                if remaining > 0:
+                    reward += self.invalid_penalty
+                    self.unscheduled_jobs += 1
+                else:
+                    circuit = job.circuit
+                    wig = self.scheduler.convert_to_weighted_graph(circuit)
+
+                    k_eff = len(used_qpus)
+                    wig_nodes = int(wig.number_of_nodes())
+
+                    # Prevent partitioning failure modes
+                    if k_eff > max(1, wig_nodes):
+                        reward += self.invalid_penalty
+                        self.unscheduled_jobs += 1
+                        invalid = True
+                    else:
+                        if self.reward_mode == "simple":
+                            # Build placement using k_eff (effective QPUs)
+                            if k_eff == 1:
+                                qpu_list = [self.qcloud.qpus[used_qpus[0]]]      # LIST OF QPU OBJECTS
+                                place = placement(job, 1, qpu_list, wig)
+
+                                # match heuristic behavior
+                                place.communication_cost = 0
+
+                                # IMPORTANT for execution mode:
+                                # heuristic sets time/modified_circuit; do the same
+                                place.modified_circuit = circuit
+                                try:
+                                    # if placement has a method for single case
+                                    place.get_time(1)
+                                except Exception:
+                                    # leave time as-is if simulator fills it later
+                                    pass
+                            else:
+                                parts = self.scheduler.partition_circuit(k_eff, wig)
+                                labels = sorted(set(parts[0]))
+                                place = placement(job, parts, [{j: used_qpus[i] for i, j in enumerate(labels)}], wig)
+                                place.get_communication_cost(wig)
+                                place.get_time(parts)
+                            if getattr(place, "partition", 1) == 1:
+                                # single-qpu => comm cost 0
+                                reward -= 0.0
+                            else:
+                                # function mutates place.communication_cost
+                                if hasattr(place, "communication_cost"):
+                                    place.communication_cost = 0.0
+                                place.get_communication_cost(wig)
+                                reward -= self.comm_cost_scale * float(getattr(place, "communication_cost", 0.0))
+                        else:
+                            # Build placement using k_eff (effective QPUs)
+                            if k_eff == 1:
+                                qpu_list = [self.qcloud.qpus[used_qpus[0]]]      # LIST OF QPU OBJECTS
+                                place = placement(job, 1, qpu_list, wig)
+
+                                # match heuristic behavior
+                                place.communication_cost = 0
+
+                                # IMPORTANT for execution mode:
+                                # heuristic sets time/modified_circuit; do the same
+                                place.modified_circuit = circuit
+                                try:
+                                    # if placement has a method for single case
+                                    place.get_time(1)
+                                except Exception:
+                                    # leave time as-is if simulator fills it later
+                                    pass
+                            else:
+                                # parts = self.scheduler.partition_circuit(k_eff, wig)
+                                # labels = sorted(set(parts[0]))
+                                # place = placement(job, parts, [{j: used_qpus[i] for i, j in enumerate(labels)}], wig)
+                                # place.get_communication_cost(wig)
+                                # place.get_time(parts)
+                                # make sure we don't exceed available qpus
+                                parts = self.scheduler.partition_circuit(k_eff, wig)
+                                print("St:",parts)
+                                comb = {k_eff: parts}
+                                count = Counter(parts[0])
+                                labels = list(count.keys())
+
+                                # must match how many partitions exist
+                                if len(labels) != len(used_qpus):
+                                    invalid = True
+                                    assert False
+                                else:
+                                    mapping = {}
+                                    for i, label in enumerate(labels):
+                                        mapping[label] = used_qpus[i]
+
+                                    place = placement(job, comb[k_eff], [mapping], wig)
+                                    place.get_communication_cost(wig)
+                                    place.get_time(parts)
+
+                            # execution-mode path: use estimated time as cost
+                            if getattr(place, "time", None) is None:
+                                place.time = 0.0
+                            
+                            if place.time == 0.0 and job_depth > 0:
+                                place.time = job_depth
+                            if invalid:
+                                reward += self.invalid_penalty
+                                self.unscheduled_jobs += 1
+                            else:
+                                # execution-mode path: use estimated time as cost
+                                if getattr(place, "time", None) is None:
+                                    place.time = 0.0
+                                
+                                if place.time == 0.0 and job_depth > 0:
+                                    place.time = job_depth
+                            
+                                reward -= float(place.time)
+
+
+
+                        
+
+        # advance job
         self.current_job_idx += 1
         if self.current_job_idx >= len(self.jobs):
             done = True
@@ -193,59 +437,98 @@ class QCloudBatchEnv(gym.Env):
             self.current_job = self.jobs[self.current_job_idx]
 
         if done:
-            if self.reward_mode == "execution":
-              self.flow_scheduler.run()
-              self.des.run()
+            # if self.reward_mode == "execution":
+            #     self.flow_scheduler.run()
+            #     print("finished flow")
+            #     self.des.run()
+            #     if self.use_makespan_reward:
+            #         end_times = self.des_logger.get_end_times()
+            #         makespan = max(end_times) if end_times else 0.0
+            #         reward -= float(makespan)
+            #         info["makespan"] = float(makespan)
+            #     else:
+            #         jcts = self.des_logger.get_jcts()
+            #         sum_jct = float(sum(jcts)) if jcts else 0.0
+            #         reward -= sum_jct
+            #         info["sum_jct"] = float(sum_jct)
+
             reward -= self.unscheduled_penalty * float(self.unscheduled_jobs)
             info["unscheduled_jobs"] = int(self.unscheduled_jobs)
 
-        obs = (
-            self._build_observation()
-            if not done
-            else self._build_terminal_observation()
-        )
+        obs = self._build_observation() if not done else self._build_terminal_observation()
         return obs, float(reward), done, truncated, info
 
     def _build_observation(self):
-        total_qubits_norm = self.total_qubits / np.maximum(
-            self.total_qubits.max(), 1.0
-        )
+        # normalize
+        total_qubits_norm = self.total_qubits / np.maximum(self.total_qubits.max(), 1.0)
         available_norm = self.qpu_available / np.maximum(self.total_qubits, 1.0)
         degree_norm = self.degrees / self.max_degree
 
-        node_features = np.stack(
-            [available_norm, total_qubits_norm, degree_norm], axis=-1
-        ).astype(np.float32)
+        if self.reward_mode == "execution":
+            occupied = np.array([1.0 if q.occupied else 0.0 for q in self.qcloud.qpus], dtype=np.float32)
+
+            running_counts = []
+            for q in self.qcloud.qpus:
+                cnt = 0
+                for _, st in getattr(q, "job_status", {}).items():
+                    if st == "running":
+                        cnt += 1
+                running_counts.append(cnt)
+            running_counts = np.array(running_counts, dtype=np.float32)
+            running_norm = running_counts / max(1.0, float(self.jobs_per_episode))
+
+            node_features_real = np.stack(
+                [available_norm, total_qubits_norm, degree_norm, occupied, running_norm],
+                axis=-1
+            ).astype(np.float32)
+        else:
+            node_features_real = np.stack(
+                [available_norm, total_qubits_norm, degree_norm],
+                axis=-1
+            ).astype(np.float32)
 
         job = self.current_job
         n_qubits, depth, n_2qb = self._extract_job_stats(job)
 
-        rel_qubits = n_qubits / (self.total_qubits.sum() + 1e-6)
+        rel_qubits = n_qubits / (float(self.total_qubits.sum()) + 1e-6)
         rel_depth = depth / (depth + 1.0)
         density = n_2qb / max(n_qubits, 1.0)
         density = density / (density + 1.0)
 
-        job_features = np.array(
-            [rel_qubits, rel_depth, density], dtype=np.float32
-        )
+        job_features = np.array([rel_qubits, rel_depth, density], dtype=np.float32)
 
-        action_mask = (self.qpu_available > 0).astype(np.float32)
+        # action mask is also in real index space initially
+        action_mask_real = (self.qpu_available > 0).astype(np.float32)
+
+        # present in permuted obs index space
+        node_features = node_features_real[self.perm]
+        action_mask = action_mask_real[self.perm]
+        # PADDING & SCATTERING: Create fixed-size buffers and fill them
+        node_features_padded = np.zeros((self.max_num_qpus, self.node_feature_dim), dtype=np.float32)
+        action_mask_padded = np.zeros((self.max_num_qpus,), dtype=np.float32)
+
+        # Find which observation slots are active and which real QPUs they map to
+        valid_obs_slots = np.where(self.obs_to_real_map != -1)[0]
+        real_indices_for_slots = self.obs_to_real_map[valid_obs_slots]
+
+        node_features_padded[valid_obs_slots] = node_features_real[real_indices_for_slots]
+        action_mask_padded[valid_obs_slots] = action_mask_real[real_indices_for_slots]
 
         return {
             "node_features": node_features,
+            "node_features": node_features_padded,
             "job_features": job_features,
             "action_mask": action_mask,
+            "action_mask": action_mask_padded,
         }
 
     def _build_terminal_observation(self):
         return {
-            "node_features": np.zeros(
-                (self.num_qpus, self.node_feature_dim), dtype=np.float32
-            ),
-            "job_features": np.zeros(
-                (self.job_feature_dim,), dtype=np.float32
-            ),
+            "node_features": np.zeros((self.num_qpus, self.node_feature_dim), dtype=np.float32),
+            "node_features": np.zeros((self.max_num_qpus, self.node_feature_dim), dtype=np.float32),
+            "job_features": np.zeros((self.job_feature_dim,), dtype=np.float32),
             "action_mask": np.zeros((self.num_qpus,), dtype=np.float32),
+            "action_mask": np.zeros((self.max_num_qpus,), dtype=np.float32),
         }
 
     def _extract_job_stats(self, job):
@@ -260,6 +543,7 @@ class QCloudBatchEnv(gym.Env):
         except Exception:
             depth = 0.0
         return n_qubits, depth, n_2qb
+
 
 
 
